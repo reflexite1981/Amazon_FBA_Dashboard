@@ -277,30 +277,30 @@ if st.session_state.step == 1:
         type=["csv", "xlsx"]
     )
 
-    if uploaded_file:
+    if uploaded_file is not None:
 
         # -------------------------
         # 📥 LOAD FILE
         # -------------------------
-        if uploaded_file:
+        if uploaded_file.name.endswith(".csv"):
+            df = pd.read_csv(uploaded_file)
 
-            if uploaded_file.name.endswith(".csv"):
-                df = pd.read_csv(uploaded_file)
-        
-            elif uploaded_file.name.endswith(".xlsx"):
-                excel_file = pd.ExcelFile(uploaded_file)
-                sheet = st.sidebar.selectbox("Sheet", excel_file.sheet_names)
-                df = pd.read_excel(uploaded_file, sheet_name=sheet)
-
+        elif uploaded_file.name.endswith(".xlsx"):
+            excel_file = pd.ExcelFile(uploaded_file)
+            sheet = st.sidebar.selectbox(
+                "Sheet",
+                excel_file.sheet_names
+            )
+            df = pd.read_excel(
+                uploaded_file,
+                sheet_name=sheet
+            )
 
         # -------------------------
-        # 🧹 CLEANING (AHORA SÍ)
+        # 🧹 CLEANING
         # -------------------------
-
-        # limpiar columnas
         df.columns = df.columns.str.strip()
 
-        # rename robusto
         rename_map = {
             "Price  US$": "Price",
             "Price US$": "Price",
@@ -311,62 +311,137 @@ if st.session_state.step == 1:
 
         df = df.rename(columns=rename_map)
 
-        # función única (SOLO UNA VEZ)
         def clean_numeric(x):
             try:
                 if pd.isna(x):
                     return 0.0
-        
+
                 x = str(x).strip()
-                x = x.replace("$", "").replace("€", "").replace(" ", "")
-        
-                # 🔥 CASO 1: formato europeo con miles → 88.805,96
+
+                x = (
+                    x.replace("US$", "")
+                    .replace("$", "")
+                    .replace("€", "")
+                    .replace("£", "")
+                    .replace(" ", "")
+                )
+
+                if not x:
+                    return 0.0
+
+                # Punto y coma presentes
                 if "." in x and "," in x:
-                    x = x.replace(".", "").replace(",", ".")
-        
-                # 🔥 CASO 2: decimal con coma (sin miles) → 9080,1 / 11,25
+                    last_dot = x.rfind(".")
+                    last_comma = x.rfind(",")
+
+                    # Europeo: 88.805,96
+                    if last_comma > last_dot:
+                        x = (
+                            x.replace(".", "")
+                            .replace(",", ".")
+                        )
+
+                    # US: 88,805.96
+                    else:
+                        x = x.replace(",", "")
+
+                # Solo coma
                 elif "," in x:
-                    x = x.replace(",", ".")
-        
-                # 🔥 CASO 3: formato US → 1,234.56
-                elif "," in x:
-                    x = x.replace(",", "")
-        
+                    decimal_places = len(
+                        x.split(",")[-1]
+                    )
+
+                    # Europeo decimal: 11,25
+                    if decimal_places in (1, 2):
+                        x = x.replace(",", ".")
+
+                    # US miles: 1,234
+                    else:
+                        x = x.replace(",", "")
+
+                # Solo punto
+                elif "." in x:
+                    parts = x.split(".")
+
+                    # Europeo miles: 1.234
+                    if (
+                        len(parts) > 1
+                        and all(
+                            len(part) == 3
+                            for part in parts[1:]
+                        )
+                        and len(parts[0]) <= 3
+                    ):
+                        x = x.replace(".", "")
+
                 return float(x)
-        
-            except:
+
+            except (ValueError, TypeError):
                 return 0.0
 
-        # aplicar cleaning
-        for col in ["Revenue", "Fees", "Price", "ASIN Sales", "Parent Level Sales"]:
+        # -------------------------
+        # APLICAR CLEANING
+        # -------------------------
+        numeric_columns = [
+            "Revenue",
+            "Fees",
+            "Price",
+            "ASIN Sales",
+            "Parent Level Sales"
+        ]
+
+        for col in numeric_columns:
             if col in df.columns:
-                df[col] = df[col].apply(clean_numeric)
+                df[col] = df[col].apply(
+                    clean_numeric
+                )
 
         # -------------------------
         # 🚨 VALIDACIÓN
         # -------------------------
-        required_cols = ["Revenue", "Fees", "ASIN Sales"]
+        required_cols = [
+            "Revenue",
+            "Fees",
+            "ASIN Sales"
+        ]
 
-        missing = [col for col in required_cols if col not in df.columns]
+        missing = [
+            col
+            for col in required_cols
+            if col not in df.columns
+        ]
 
         if missing:
-            st.error(f"Missing columns: {missing}")
+            st.error(
+                f"Missing columns: {missing}"
+            )
             st.stop()
 
         # -------------------------
-        # DEBUG (recomendado)
+        # DEBUG TEMPORAL
         # -------------------------
-        st.write("Columns:", df.columns.tolist())
-        st.write(df[["Price", "Revenue", "Fees"]].head())
+        st.write(
+            "Columns:",
+            df.columns.tolist()
+        )
+
+        st.write(
+            df[
+                ["Price", "Revenue", "Fees"]
+            ].head()
+        )
 
         # -------------------------
         # SAVE STATE
         # -------------------------
-        with st.spinner("Processing data..."):
+        with st.spinner(
+            "Processing data..."
+        ):
             st.session_state.df = df
             st.session_state.step = 2
             st.rerun()
-    st.stop() 
+
+    st.stop()
 
     
 # -------------------------
@@ -488,23 +563,53 @@ df["listing_score"] = (
 )
 
 
-# Señales comerciales visibles de Amazon
-df["buybox_flag"] = (
+# -------------------------
+# 🛡️ COMMERCIAL TRUST SIGNALS
+# -------------------------
+
+# Helium 10 devuelve el nombre del vendedor que posee la Buy Box,
+# no un valor Yes/No.
+buybox_text = (
     df["Buy Box"]
+    .fillna("")
     .astype(str)
     .str.strip()
     .str.lower()
-    .isin(["yes", "true", "1"])
-    .astype(int)
+)
+
+invalid_buybox = {
+    "",
+    "nan",
+    "none",
+    "null",
+    "-",
+    "n/a"
+}
+
+# 1 = existe un vendedor identificado con Buy Box
+# 0 = el campo está vacío o no contiene información válida
+df["buybox_flag"] = (
+    ~buybox_text.isin(invalid_buybox)
+).astype(int)
+
+# Best Seller sí se interpreta como una variable booleana
+bestseller_text = (
+    df["Best Seller"]
+    .fillna("")
+    .astype(str)
+    .str.strip()
+    .str.lower()
 )
 
 df["bestseller_flag"] = (
-    df["Best Seller"]
-    .astype(str)
-    .str.strip()
-    .str.lower()
-    .isin(["yes", "true", "1"])
-    .astype(int)
+    bestseller_text.isin(
+        ["yes", "true", "1", "si", "sí"]
+    )
+).astype(int)
+
+# ¿Buy Box realmente diferencia a los productos?
+buybox_is_informative = (
+    df["buybox_flag"].nunique(dropna=False) > 1
 )
 
 
@@ -621,7 +726,15 @@ sellers_informative = (
     and seller_range >= 2
 )
 
-
+# -------------------------------------------------------
+# KPI Studio Methodology
+# Advertising Dependency v2.0
+#
+# Variables that do not differentiate products within the
+# current market automatically lose their assigned weight.
+# The remaining weights are proportionally redistributed
+# to preserve the full explanatory power of the score.
+# -------------------------------------------------------
 # -------------------------
 # PESOS DEL MODELO
 # -------------------------
@@ -635,17 +748,44 @@ ad_weights = {
     "ad_dep_sellers": 0.10
 }
 
+bestseller_is_informative = (
+    df["bestseller_flag"].nunique(dropna=False) > 1
+)
+
+if not buybox_is_informative:
+    ad_weights["ad_dep_buybox"] = 0.0
+
+if not bestseller_is_informative:
+    ad_weights["ad_dep_bestseller"] = 0.0
 # Si Active Sellers no discrimina, su peso pasa a cero
 if not sellers_informative:
     ad_weights["ad_dep_sellers"] = 0.0
 
 # Redistribuir proporcionalmente para que sumen 1
+# Redistribuir proporcionalmente para que sumen 1
 total_ad_weight = sum(ad_weights.values())
 
-ad_weights = {
-    variable: weight / total_ad_weight
-    for variable, weight in ad_weights.items()
-}
+# Validación de seguridad
+if total_ad_weight > 0:
+
+    ad_weights = {
+        variable: weight / total_ad_weight
+        for variable, weight in ad_weights.items()
+    }
+
+else:
+
+    # Fallback extremadamente raro:
+    # si ninguna variable aporta información,
+    # utilizar únicamente las señales estructurales.
+    ad_weights = {
+        "ad_dep_bsr": 0.45,
+        "ad_dep_review_velocity": 0.30,
+        "ad_dep_listing": 0.25,
+        "ad_dep_buybox": 0.00,
+        "ad_dep_bestseller": 0.00,
+        "ad_dep_sellers": 0.00
+    }
 
 
 # -------------------------
@@ -832,24 +972,56 @@ df["momentum_score"] = (
 )
 
 # -------------------------
-# 🛡️ TRUST SIGNALS
+# 🛡️ TRUST SCORE
 # -------------------------
-df["buybox_flag"] = df["Buy Box"].astype(str).str.lower().isin(["yes", "true"]).astype(int)
-df["bestseller_flag"] = df["Best Seller"].astype(str).str.lower().isin(["yes", "true"]).astype(int)
 
-df["trust_score"] = (
-    df["buybox_flag"] * 0.6 +
-    df["bestseller_flag"] * 0.4
+if buybox_is_informative:
+    # Buy Box diferencia efectivamente a los ASINs
+    df["trust_score"] = (
+        df["buybox_flag"] * 0.60
+        + df["bestseller_flag"] * 0.40
+    )
+else:
+    # Si Buy Box es igual para todos, no aporta información comparativa
+    df["trust_score"] = (
+        df["bestseller_flag"].astype(float)
+    )
+
+# -------------------------
+# 🏆 TRUE MARKET POWER (ADAPTIVE)
+# -------------------------
+
+# Trust aporta información solo si realmente diferencia productos.
+trust_is_informative = (
+    df["trust_score"].nunique(dropna=False) > 1
 )
 
-# -------------------------
-# 🏆 TRUE MARKET POWER (CORE KPI)
-# -------------------------
-df["market_power_score"] = (
-    df["authority_score"] * 0.5 +
-    df["momentum_score"] * 0.3 +
-    df["trust_score"] * 0.2
-)
+if trust_is_informative:
+
+    df["market_power_score"] = (
+        df["authority_score"] * 0.50 +
+        df["momentum_score"] * 0.30 +
+        df["trust_score"] * 0.20
+    )
+
+else:
+
+    # -------------------------------------------------------
+    # Adaptive Market Power Weighting
+    #
+    # If Trust Signals (Buy Box / Best Seller) do not provide
+    # any discriminatory information within the current market,
+    # their contribution is removed and the 20% weight is
+    # proportionally redistributed between Authority and
+    # Momentum to preserve the full explanatory power of the
+    # Market Power Score.
+    # -------------------------------------------------------
+    
+    df["market_power_score"] = (
+        df["authority_score"] * 0.625 +
+        df["momentum_score"] * 0.375
+    )
+
 # -------------------------
 # 📅 CREATION DATE (NUEVO)
 # -------------------------
